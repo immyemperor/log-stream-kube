@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flask-log-app.fullname" . }}
+  labels:
+    {{- include "flask-log-app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "flask-log-app.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.datadog.env }}
+      annotations:
+        # Datadog Log Integration Annotation (Crucial for log forwarding)
+        # This tells the Datadog Agent to collect logs from this container,
+        # treating them as 'python' source, and defining multiline rules.
+        ad.datadoghq.com/{{ $.Values.datadog.serviceName }}.logs: |
+          [
+            {
+              "source": "python",
+              "service": "{{ $.Values.datadog.serviceName }}",
+              "log_processing_rules": [
+                # Rule to combine multi-line Python stack traces into a single log entry
+                {"type": "multi_line", "name": "log_start_with_date", "pattern": "\\[\\d{4}-\\d{2}-\\d{2}"}
+              ]
+            }
+          ]
+      {{- end }}
+      labels:
+        {{- include "flask-log-app.selectorLabels" . | nindent 8 }}
+        env: {{ .Values.datadog.env }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          # Environment variables for Datadog APM/Tracing if enabled
+          env:
+            - name: DD_SERVICE
+              value: {{ .Values.datadog.serviceName }}
+            - name: DD_ENV
+              value: {{ .Values.datadog.env }}
+          # Liveness and readiness probes should be added here for production
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {} # Resource requests/limits should be configured in values.yaml for production

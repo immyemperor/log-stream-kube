@@ -1,0 +1,21 @@
+# Default values for flask-log-app.
+
+replicaCount: 1
+
+image:
+  repository: my-flask-log-app # Placeholder image repository (must be built/pushed first)
+  pullPolicy: IfNotPresent
+  # Tag will default to the chart's appVersion
+  tag: "1.0.0"
+
+service:
+  type: ClusterIP
+  port: 5000
+  targetPort: 5000
+
+# Configuration for Datadog logging and tracing integration
+datadog:
+  # The service name used by Datadog for tagging and identification
+  serviceName: "flask-log-generator"
+  # Optional environment tag
+  env: "production"
