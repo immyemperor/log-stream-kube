@@ -1,0 +1,250 @@
+version: '3.8'
+
+services:
+  # --- 1. Graylog Stack Components (Necessary for Graylog Server) ---
+  mongodb:
+    image: mongo:5.0.0
+    container_name: mongodb
+    volumes:
+      - mongo_data:/data/db
+    restart: always
+    networks:
+      - logging-network
+
+  elasticsearchlog:
+    # Using a compatible Elasticsearch version for Graylog 4.x
+    image: docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2
+    container_name: elasticsearchlog
+    environment:
+      # Required for a single-node setup in development/testing
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    restart: always
+    networks:
+      - logging-network
+
+  graylog:
+    image: graylog/graylog:6.3
+    container_name: graylog
+    environment:
+      # General Configuration
+      - GRAYLOG_WEB_ENDPOINT_URI=http://127.0.0.1:9000/
+      - GRAYLOG_SERVER_JAVA_OPTS=-Xms512m -Xmx512m
+      # MongoDB Configuration
+      - GRAYLOG_MONGODB_URI=mongodb://mongodb:27017/graylog
+      # Elasticsearch Configuration
+      - GRAYLOG_ELASTICSEARCH_HOSTS=http://elasticsearchlog:9200
+      # Security Configuration (Replace these with strong, generated values in production)
+      - GRAYLOG_PASSWORD_SECRET=graylogadmin@12345
+      # Hash of 'admin'
+      - GRAYLOG_ROOT_PASSWORD_SHA2=aad142628ee83214ce5a6f447e12ab3fab3a0d1181aad4d39c42663433b285d4
+      - GRAYLOG_ROOT_USERNAME=admin
+    ports:
+      - "9000:9000"       # Web interface (Access at http://localhost:9000)
+      - "12201:12201/udp" # GELF Input UDP (Flask app sends logs here)
+    depends_on:
+      - mongodb
+      - elasticsearchlog
+    restart: always
+    networks:
+      - logging-network
+
+  # --- 2. Flask Application Service ---
+  flask-app:
+    image: flask-log-generator:0.0.1
+    ports:
+      - "5000:5000"
+    environment:
+      # Datadog configuration
+      - DD_SERVICE=flask-log-generator
+      - DD_ENV=local-docker
+      # Graylog configuration for the Python app (Service name is 'graylog')
+      - GRAYLOG_HOST=graylog 
+      - GRAYLOG_PORT=12201   
+    # Datadog still collects container logs via the Docker JSON-file driver
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    depends_on:
+      - graylog # Ensure Graylog is available before the app tries to log
+    networks:
+      - logging-network
+
+  # --- 3. Datadog Agent Service (Log Collector) ---
+  datadog-agent:
+    container_name: datadog-agent
+    image: datadog/agent:latest
+    environment:
+      # !!! REPLACE THIS with your actual API Key !!!
+      - DD_API_KEY=YOUR_DD_API_KEY_HERE 
+      - DD_SITE=datadoghq.com 
+      - DD_LOGS_ENABLED=true
+      - DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL=true 
+      - DD_APM_ENABLED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc/:/host/proc/:ro
+      - /sys/fs/cgroup:/host/sys/fs/cgroup:ro
+    ports:
+      - "8126:8126/tcp"
+    networks:
+      - logging-network
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - logging-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - logging-network
+  # Zookeeper for Kafka coordination
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - logging-network
+
+  # Kafka message broker
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - logging-network
+  kafka-init-topics:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init-topics
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka to be ready...' &&
+        cub kafka-ready -b kafka:29092 1 100 &&
+        echo 'Creating Kafka topics...' &&
+        kafka-topics --create --if-not-exists --topic test_topic --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 &&
+        echo 'Topics created successfully!'
+      "
+    depends_on:
+      - kafka
+    networks:
+      - logging-network
+
+  # PostgreSQL database for Hasura
+  hasurapostgres:
+    image: postgres:15
+    container_name: hasurapostgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: hasura_db
+      POSTGRES_USER: hasurauser
+      POSTGRES_PASSWORD: hasurapassword
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - logging-network
+
+  # Hasura GraphQL Engine
+  hasura:
+    image: hasura/graphql-engine:latest.cli-migrations-v3
+    container_name: hasura
+    depends_on:
+      - hasurapostgres
+    ports:
+      - "8085:8080"
+    restart: always
+    environment:
+      HASURA_GRAPHQL_DATABASE_URL: postgres://hasurauser:hasurapassword@hasurapostgres:5432/hasura_db
+      HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
+      HASURA_GRAPHQL_ADMIN_SECRET: myadminsecretkey
+      HASURA_GRAPHQL_DEV_MODE: "true"
+    networks:
+      - logging-network
+
+  # Flask Producer service
+  producer:
+    image: producer:0.0.1
+    depends_on:
+      - kafka
+      - kafka-init-topics
+    environment:
+      KAFKA_BROKER: kafka:29092
+      KAFKA_SINK_TOPIC: test_topic
+    ports:
+      - "5002:5002"
+    restart: unless-stopped
+    networks:
+      - logging-network
+
+  # Flask Consumer service
+  consumer:
+    image: consumer:0.0.1
+    depends_on:
+      - kafka
+      - hasurapostgres
+      - kafka-init-topics
+    ports:
+      - "5003:5003"
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKER: kafka:29092
+      POSTGRES_HOST: hasurapostgres
+      POSTGRES_USER: hasurauser
+      POSTGRES_PASSWORD: hasurapassword
+      POSTGRES_DB: hasura_db
+      KAFKA_SOURCE_TOPIC: test_topic
+    networks:
+      - logging-network
+
+# Define volumes for persistent data
+volumes:
+  mongo_data:
+  es_data:
+  prometheus_data:
+  grafana_data:
+  postgres-data:
+
+networks:
+  logging-network:
+    driver: bridge
