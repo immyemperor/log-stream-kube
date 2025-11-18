@@ -5,6 +5,7 @@ from flask import Flask, request, redirect, url_for
 # Import the GELF handler
 from graypy import GELFUDPHandler 
 from prometheus_flask_exporter import PrometheusMetrics
+from pydantic import BaseModel
 
 # --- Graylog Configuration ---
 # Read configuration from environment variables for containerization

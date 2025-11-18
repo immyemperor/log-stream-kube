@@ -1,4 +1,5 @@
-from flask import Flask, jsonify
+from flask import Flask, current_app, jsonify
+from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from kafka import KafkaConsumer
 from sqlalchemy import create_engine, Column, String, Text
@@ -12,12 +13,18 @@ import time
 import logging
 import sys
 import multiprocessing
+import re
+
+from models.msg import Message
+from db_ref import db
 
 # --- Database Setup ---
-db_user = os.environ.get("POSTGRES_USER")
-db_password = os.environ.get("POSTGRES_PASSWORD")
-db_host = os.environ.get("POSTGRES_HOST")
-db_name = os.environ.get("POSTGRES_DB")
+db_user = os.environ.get("POSTGRES_USER","hasurauser")
+db_password = os.environ.get("POSTGRES_PASSWORD","hasurapassword")
+db_host = os.environ.get("POSTGRES_HOST","localhost")
+db_port = os.environ.get("POSTGRES_PORT","8085")
+db_name = os.environ.get("POSTGRES_DB","hasura_db")
+KAFKA_SOURCE_TOPIC = os.environ.get('KAFKA_SOURCE_TOPIC','test_topic')
 from graypy import GELFUDPHandler 
 from prometheus_flask_exporter import PrometheusMetrics
 
@@ -66,7 +73,7 @@ def wait_for_db():
     print("Waiting for database...")
     while True:
         try:
-            engine = create_engine(f'postgresql://{db_user}:{db_password}@{db_host}/{db_name}')
+            engine = create_engine(f'postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}')
             engine.connect()
             print("Database is ready!")
             return engine
@@ -105,26 +112,44 @@ kafka_broker = os.environ.get("KAFKA_BROKER", "localhost:9092")
 
 
 # --- Flask App ---
-app = Flask(__name__)
-metrics = PrometheusMetrics(app)
-app.config['SQLALCHEMY_DATABASE_URI'] = f'postgresql://{db_user}:{db_password}@{db_host}/{db_name}' # Or your specific database URI
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+def create_app():
+    app = Flask(__name__)
+    metrics = PrometheusMetrics(app)
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'postgresql://{db_user}:{db_password}@{db_host}/{db_name}' # Or your specific database URI
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    # static information as metric
+    metrics.info('app_info', 'Application info', version='1.0.3')
+    db.init_app(app)
+    migrate = Migrate()
+    migrate.init_app(app, db)
 
-class Message(db.Model):
-    __tablename__ = "messages"
-    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    content = db.Column(db.Text, nullable=False)
+    # with app.app_context():
+    #     db.create_all() # Create tables based on your models
 
-    def __repr__(self):
-        return f'<Message {self.id} {self.content}>'
-    def to_json(self):
-        return {"id": self.id, "message":self.content}
+    return app
+
+
+def extract_message(st: str):
+    pattern = r"(.*?)\#(.*?)(?:##|$)"
+    matches = re.findall(pattern, st)
+    extracted_dict = {}
+    try:
+        for key, value in matches:
+            if value == 'True' or value == 'true' :
+                extracted_dict[key.strip()] = True
+            elif value == 'False' or value == 'false':
+                extracted_dict[key.strip()] = False
+            else:
+                extracted_dict[key.strip()] = value.strip() # Remove leading/trailing whitespace
+        return extracted_dict
+    except Exception as e:
+        logger.critical(f"Exception occured while converting message: {e}")
+        return e
 
 def kafka_listener(app):
     with app.app_context():
         consumer = KafkaConsumer(
-            os.environ.get('KAFKA_SOURCE_TOPIC'),
+            KAFKA_SOURCE_TOPIC,
             bootstrap_servers=[kafka_broker],
             auto_offset_reset='earliest',
             enable_auto_commit=True,
@@ -137,10 +162,12 @@ def kafka_listener(app):
         for message in consumer:
             try:
                 data = message.value
-                logger.info(f"Received message: {data}")
-                
+                logger.info(f"Received message: {data}") 
                 # Start database transaction
-                new_message = Message(id=uuid.UUID(data['id']), content=data['content'])
+                msg = extract_message(data['content'])
+                msg.update({'sender_msg_id': data['id']})
+                logger.info(f"Message transformed: {msg}")
+                new_message = Message(**msg)
                 db.session.add(new_message)
                 
                 try:
@@ -155,9 +182,6 @@ def kafka_listener(app):
             except Exception as e:
                 # This catches issues with deserialization, data access (e.g., data['id']), etc.
                 logger.error(f"❌ Error processing message: {e} - Message offset: {message.offset}")
-
-# static information as metric
-metrics.info('app_info', 'Application info', version='1.0.3')
 
 
 # Map log level names to the actual logger methods
@@ -176,32 +200,25 @@ def fetch_data_generator():
             # Process the row if needed (e.g., convert to JSON)
             yield msg # Example: yield each row as a string followed by a newline
 
-logger.info("Setting up kafka consumer thread.")
-listener_thread = threading.Thread(target=kafka_listener, args=(app,))
-listener_thread.daemon = False
-logger.info("Kafka consumer thread setup completed.")
-logger.info("Kafka consumer starting up...")
-listener_thread.start()
-logger.info("Kafka consumer thread joinig.")
-listener_thread.join()
-logger.info("Kafka consumer started successfully.")
-
-@app.route('/')
-def index():
-    msg = fetch_data_generator()
-    return {'msg': list(msg)}
+# @app.route('/')
+# def index():
+#     msg = fetch_data_generator()
+#     return {'msg': list(msg)}
 
 if __name__ == '__main__':
     # Start the Kafka listener in a separate thread
-    with app.app_context():
-        logger.info("Dropping all tables...")
-        db.drop_all()
-        logger.info("Recreating all tables...")
-        db.create_all()
-        logger.info("Database recreated successfully.")
-        logger.info("Message table created successfully.")
     logger.info("Flask consumer application starting up...")
     # The default Flask logging system is disabled to prevent duplicate output
     # since we are using our custom logger (logger.addHandler(stream_handler)).
+    app = create_app()
     app.run(debug=True)
+    logger.info("Setting up kafka consumer thread.")
+    listener_thread = threading.Thread(target=kafka_listener, args=(app,))
+    listener_thread.daemon = False
+    logger.info("Kafka consumer thread setup completed.")
+    logger.info("Kafka consumer starting up...")
+    listener_thread.start()
+    logger.info("Kafka consumer thread joinig.")
+    listener_thread.join()
+    logger.info("Kafka consumer started successfully.")
     logger.info("Flask application started successfully.")

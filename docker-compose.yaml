@@ -205,6 +205,7 @@ services:
   # Flask Producer service
   producer:
     image: producer:0.0.1
+    container_name: producer-app
     depends_on:
       - kafka
       - kafka-init-topics
@@ -220,6 +221,7 @@ services:
   # Flask Consumer service
   consumer:
     image: consumer:0.0.1
+    container_name: consumer-app
     depends_on:
       - kafka
       - hasurapostgres
@@ -230,10 +232,15 @@ services:
     environment:
       KAFKA_BROKER: kafka:29092
       POSTGRES_HOST: hasurapostgres
+      POSTGRES_PORT: 8085
       POSTGRES_USER: hasurauser
       POSTGRES_PASSWORD: hasurapassword
       POSTGRES_DB: hasura_db
       KAFKA_SOURCE_TOPIC: test_topic
+      GRAYLOG_HOST: localhost
+      GRAYLOG_PORT: 12201
+
+    command: flask db upgrade
     networks:
       - logging-network
 

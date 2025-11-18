@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from kafka import KafkaProducer
 import os
 import json
@@ -8,6 +9,7 @@ import sys
 
 from graypy import GELFUDPHandler 
 from prometheus_flask_exporter import PrometheusMetrics
+from pydantic import BaseModel, ValidationError
 
 # --- Graylog Configuration ---
 # Read configuration from environment variables for containerization
@@ -52,6 +54,7 @@ except Exception as e:
 
 
 app = Flask(__name__)
+CORS(app)
 kafka_broker = os.environ.get("KAFKA_BROKER", "localhost:9092")
 
 # Create Kafka producer
@@ -90,6 +93,48 @@ def send_message():
     producer.flush()  # Ensure message is sent
     logger.info(f"message sent: {message_payload}")
     return jsonify({"message": "Message sent to Kafka", "payload": message_payload}), 200
+
+class MessagePost(BaseModel):
+    sender_id: str
+    content: str
+    created_at: str
+    read_at: str
+    is_delivered: bool
+    is_read: bool
+    sender_name: str
+    
+
+@app.route('/send_message',methods=["POST"])
+def send_msg():
+    try:
+        data = request.json
+        logger.info(f"Message data: {data}")
+        logger.info(f"Validating Message: {data}")
+        msg_data = MessagePost(**data)
+        if msg_data:
+            st = [f'{key}#{val}' for key,val in data.items()]
+            data = "##".join(st)
+            logger.info(f"Message data str: {data}")
+            message_payload = {"id": str(uuid.uuid4()), "content": data}
+            logger.info(f"Message created: {message_payload}")
+            
+            # Send the message to the 'events' topic
+            producer.send(os.environ.get('KAFKA_SINK_TOPIC'), message_payload)
+            producer.flush()  # Ensure message is sent
+            logger.info(f"Message sent: {message_payload}")
+            return jsonify({"message": "Message sent to Kafka", "payload": message_payload}), 200
+        else:
+            logger.critical("No data provided")
+            return jsonify({"error": "Missing data"}), 400
+    except ValidationError as e:
+            # Handle validation errors
+            logger.exception(f"Message Validation Error: {e.errors()}")
+            return jsonify({"error": e.errors()}), 400
+    except Exception as e:
+            # Handle other potential errors
+            logger.exception(f"Exception Occured: {e}")
+            return jsonify({"error": str(e)}), 500
+    
 
 if __name__ == '__main__':
     logger.info("Flask producer application starting up...")
